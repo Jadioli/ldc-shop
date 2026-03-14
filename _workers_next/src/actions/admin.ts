@@ -4,12 +4,13 @@ import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
 import { products, cards, reviews, categories } from "@/lib/db/schema"
 import { eq, sql, inArray, and, or, isNull, lte } from "drizzle-orm"
-import { sendTelegramMessage } from "@/lib/notifications"
+import { sendBarkMessage, sendTelegramMessage } from "@/lib/notifications"
 import { revalidatePath, updateTag } from "next/cache"
 import { setSetting, getSetting, recalcProductAggregates, recalcProductAggregatesForMany, getProductForAdmin } from "@/lib/db/queries"
 import { isAdminUsername } from "@/lib/admin-auth"
 import { getProductCardApiConfig, pullOneCardFromApi, saveProductCardApiConfig } from "@/lib/card-api"
 import { unstable_noStore } from "next/cache"
+import { isThemeFont } from "@/lib/theme-fonts"
 
 export async function checkAdmin() {
     const session = await auth()
@@ -45,16 +46,41 @@ export async function saveProduct(formData: FormData) {
     const price = formData.get('price') as string
     const compareAtPrice = (formData.get('compareAtPrice') as string | null) || null
     const category = formData.get('category') as string
-    const image = formData.get('image') as string
+    const image = (formData.get('image') as string || '').trim()
     const purchaseLimit = formData.get('purchaseLimit') ? parseInt(formData.get('purchaseLimit') as string) : null
     const isHot = formData.get('isHot') === 'on'
     const isShared = formData.get('isShared') === 'on'
     const purchaseWarning = (formData.get('purchaseWarning') as string | null)?.trim() || null
     const visibilityLevelRaw = (formData.get('visibilityLevel') as string | null)?.trim() ?? ''
+    const variantGroupId = (formData.get('variantGroupId') as string | null)?.trim() || null
+    const variantLabel = (formData.get('variantLabel') as string | null)?.trim() || null
+    const purchaseQuestionsRaw = (formData.get('purchaseQuestions') as string | null)?.trim() || null
+    let purchaseQuestions: string | null = null
+    if (purchaseQuestionsRaw) {
+        try {
+            const parsed = JSON.parse(purchaseQuestionsRaw)
+            if (Array.isArray(parsed)) {
+                const valid = parsed.filter((item: any) => item && typeof item.q === 'string' && item.q.trim() && typeof item.a === 'string' && item.a.trim())
+                purchaseQuestions = valid.length > 0 ? JSON.stringify(valid.map((item: any) => ({ q: item.q.trim(), a: item.a.trim() }))) : null
+            }
+        } catch {
+            // ignore invalid JSON
+        }
+    }
     const parsedVisibility = Number.parseInt(visibilityLevelRaw, 10)
     const visibilityLevel = Number.isFinite(parsedVisibility) ? parsedVisibility : -1
     if (![ -1, 0, 1, 2, 3 ].includes(visibilityLevel)) {
         throw new Error("Invalid visibility level")
+    }
+    if (image.startsWith('data:')) {
+        if (!image.startsWith('data:image/')) {
+            throw new Error("Only image data URLs are allowed")
+        }
+        if (image.length > 900_000) {
+            throw new Error("Product image is too large")
+        }
+    } else if (image.length > 2000) {
+        throw new Error("Product image URL is too long")
     }
 
     const doSave = async () => {
@@ -80,7 +106,10 @@ export async function saveProduct(formData: FormData) {
             purchaseWarning,
             isHot,
             isShared,
-            visibilityLevel
+            visibilityLevel,
+            variantGroupId,
+            variantLabel,
+            purchaseQuestions
         }).onConflictDoUpdate({
             target: products.id,
             set: {
@@ -94,7 +123,10 @@ export async function saveProduct(formData: FormData) {
                 purchaseWarning,
                 isHot,
                 isShared,
-                visibilityLevel
+                visibilityLevel,
+                variantGroupId,
+                variantLabel,
+                purchaseQuestions
             }
         })
     }
@@ -538,11 +570,19 @@ export async function saveShopLogo(logoUrl: string) {
     await checkAdmin()
 
     const url = logoUrl.trim()
-    if (url && url.length > 500) {
+    if (url.startsWith('data:')) {
+        if (!url.startsWith('data:image/')) {
+            throw new Error("Only image data URLs are allowed")
+        }
+        if (url.length > 1_000_000) {
+            throw new Error("Logo image is too large")
+        }
+    } else if (url && url.length > 500) {
         throw new Error("Logo URL is too long")
     }
 
     await setSetting('shop_logo', url)
+    await setSetting('shop_logo_source', url ? 'custom' : 'generated')
     await setSetting('shop_logo_updated_at', String(Date.now()))
     revalidatePath('/')
     revalidatePath('/admin/products')
@@ -656,22 +696,58 @@ export async function saveThemeColor(color: string) {
     updateTag('home:product-categories')
 }
 
+export async function saveThemeFont(font: string) {
+    await checkAdmin()
+
+    if (!isThemeFont(font)) {
+        throw new Error("Invalid theme font")
+    }
+
+    await setSetting('theme_font', font)
+    revalidatePath('/admin/settings')
+    revalidatePath('/')
+    updateTag('home:products')
+    updateTag('home:product-categories')
+}
+
 export async function saveNotificationSettings(formData: FormData) {
     await checkAdmin()
+
+    const parseBooleanField = (key: string) => {
+        const values = formData.getAll(key).map(v => String(v).toLowerCase())
+        if (values.some(v => v === 'true' || v === 'on' || v === '1')) {
+            return true
+        }
+        if (values.some(v => v === 'false' || v === 'off' || v === '0')) {
+            return false
+        }
+        return false
+    }
 
     const token = (formData.get('telegramBotToken') as string || '').trim()
     const chatId = (formData.get('telegramChatId') as string || '').trim()
     const language = (formData.get('telegramLanguage') as string || 'zh').trim()
+    const telegramEnabled = parseBooleanField('telegramEnabled')
 
     await setSetting('telegram_bot_token', token)
     await setSetting('telegram_chat_id', chatId)
     await setSetting('telegram_language', language)
+    await setSetting('telegram_enabled', telegramEnabled ? 'true' : 'false')
+
+    // Bark settings
+    const barkEnabled = parseBooleanField('barkEnabled')
+    const barkServerUrl = (formData.get('barkServerUrl') as string || '').trim()
+    const barkDeviceKey = (formData.get('barkDeviceKey') as string || '').trim()
+
+    await setSetting('bark_enabled', barkEnabled ? 'true' : 'false')
+    await setSetting('bark_server_url', barkServerUrl || 'https://api.day.app')
+    await setSetting('bark_device_key', barkDeviceKey)
 
     // Email settings
     const resendApiKey = (formData.get('resendApiKey') as string || '').trim()
     const resendFromEmail = (formData.get('resendFromEmail') as string || '').trim()
     const resendFromName = (formData.get('resendFromName') as string || '').trim()
-    const resendEnabled = formData.get('resendEnabled') === 'true'
+    const resendEnabled = parseBooleanField('resendEnabled')
     const emailLanguageRaw = (formData.get('emailLanguage') as string || '').trim()
     const emailLanguage = emailLanguageRaw === 'en' ? 'en' : 'zh'
 
@@ -681,12 +757,32 @@ export async function saveNotificationSettings(formData: FormData) {
     await setSetting('resend_enabled', resendEnabled ? 'true' : 'false')
     await setSetting('email_language', emailLanguage)
 
-    revalidatePath('/admin/notifications')
+    return {
+        telegramBotToken: token,
+        telegramChatId: chatId,
+        telegramLanguage: language || 'zh',
+        telegramEnabled,
+        barkEnabled,
+        barkServerUrl: barkServerUrl || 'https://api.day.app',
+        barkDeviceKey,
+        resendApiKey,
+        resendFromEmail,
+        resendFromName,
+        resendEnabled,
+        emailLanguage
+    }
 }
 
 export async function testNotification() {
     await checkAdmin()
     return await sendTelegramMessage("🔔 Test notification from LDC Shop")
+}
+
+export async function testBarkNotification() {
+    await checkAdmin()
+    return await sendBarkMessage("🔔 Test notification from LDC Shop", "This is a test message from LDC Shop", {
+        group: 'LDC Shop'
+    })
 }
 
 export async function testEmailNotification(to: string) {
